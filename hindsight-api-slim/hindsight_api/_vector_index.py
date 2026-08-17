@@ -73,18 +73,19 @@ _ANN_TUNING_HIGH_RECALL: dict[str, tuple[tuple[str, str], ...]] = {
     "pgvector": (("hnsw.ef_search", "200"),),
 }
 
-# Largest candidate list a backend accepts, per query. For pgvector this is a hard
-# GUC bound: `hnsw.ef_search` is declared with a valid range of 1..1000
-# (HNSW_MAX_EF_SEARCH), and SET rejects anything above it. It doubles as the ceiling
-# on how many rows one HNSW scan can return, because pgvector's candidate list *is*
-# the result set: the ground-layer search runs once with ef = hnsw.ef_search, and
-# when that list is drained the scan ends (hnswscan.c, iterative scan off — which is
-# the default and what Hindsight runs). So a `LIMIT` above this number is unreachable
-# through the index, and asking for one only costs a wider heap fetch when the
-# planner falls back to a sequential scan.
+# The per-query candidate-list knob, and the largest value it accepts. For pgvector
+# that bound is a hard GUC range: `hnsw.ef_search` is declared valid over 1..1000
+# (HNSW_MAX_EF_SEARCH), and SET rejects anything above it.
 #
-# Backends without a per-query candidate-list knob are absent: their scans are not
-# bounded this way, so the semantic arm's LIMIT stands on its own.
+# This is the setting that decides how many rows an ANN scan can return, because
+# pgvector's candidate list *is* the result set: the ground-layer search runs once
+# with ef = hnsw.ef_search, and when that list is drained the scan ends (hnswscan.c —
+# iterative scan, which would resume it, is off by default and Hindsight does not
+# enable it). A query wanting more rows than the standing value has to raise it;
+# a larger `LIMIT` alone is unreachable through the index.
+#
+# Backends without such a knob are absent: their scans are not bounded this way, so
+# a query's LIMIT stands on its own and no setting is needed.
 _ANN_CANDIDATE_LIST: dict[str, tuple[str, int]] = {
     "pgvector": ("hnsw.ef_search", 1000),
 }
@@ -192,32 +193,39 @@ def ann_search_tuning_settings(ext: str, *, kind: str) -> tuple[tuple[str, str],
 def ann_candidate_list_max(ext: str) -> int | None:
     """Return the largest per-query ANN candidate list this backend accepts.
 
-    ``None`` means the backend exposes no such bound, so nothing caps how many rows
-    a single index scan can return. Callers use this to clamp both the request they
-    make (:func:`ann_candidate_list_settings`) and the SQL ``LIMIT`` they pair it
-    with, so the two can never drift apart.
+    ``None`` means the backend exposes no such knob, so nothing bounds how many rows
+    a single index scan can return.
     """
     entry = _ANN_CANDIDATE_LIST.get(_normalize_resolved(ext))
     return entry[1] if entry is not None else None
 
 
 def ann_candidate_list_settings(ext: str, *, candidates: int) -> tuple[tuple[str, str], ...]:
-    """Return (guc_name, value) pairs sizing the ANN candidate list for one query.
+    """Return (guc_name, value) pairs widening the ANN candidate list for one query.
 
     Unlike :func:`ann_search_tuning_settings`, which serves two fixed profiles at
-    connection init, this sizes the candidate list to what a specific query asks
-    for. The value is clamped to the backend's accepted range, so a caller may pass
-    the raw row count it wants without knowing the backend's bounds.
+    connection init, this sizes the list to what a specific query needs. The value is
+    clamped to the backend's accepted range, so a caller may pass the raw count it
+    wants without knowing the backend's bounds.
 
-    Returns an empty tuple for backends with no per-query knob, in which case the
-    caller should issue no SET at all. Wrap the pairs in ``SET LOCAL`` so the value
-    reverts at transaction end and does not leak to the connection's other queries.
+    Returns an empty tuple — meaning *issue nothing* — when no setting is warranted:
+    for a backend with no such knob, and when the connection's standing high-recall
+    value (see :data:`_ANN_TUNING_HIGH_RECALL`) already covers the request, which is
+    the common case for small recall budgets. Narrowing below that standing value is
+    deliberately not done: it would trade recall for a saved round trip on exactly
+    the queries that are already cheap.
     """
     entry = _ANN_CANDIDATE_LIST.get(_normalize_resolved(ext))
     if entry is None:
         return ()
     guc, ceiling = entry
-    return ((guc, str(max(1, min(candidates, ceiling)))),)
+
+    wanted = max(1, min(candidates, ceiling))
+    standing = _ANN_TUNING_HIGH_RECALL.get(_normalize_resolved(ext), ())
+    for name, value in standing:
+        if name == guc and wanted <= int(value):
+            return ()
+    return ((guc, str(wanted)),)
 
 
 def uses_per_bank_vector_indexes(ext: str) -> bool:

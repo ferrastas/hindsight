@@ -101,7 +101,6 @@ class PostgresMemories(MemoriesExtension):
         min_semantic: float | None = None,
         min_keyword: float | None = None,
         enable_graph: bool = True,
-        candidate_ceiling: int | None = None,
     ) -> "dict[str, RecallArms]":
         """Run every recall arm for Postgres by orchestrating the split per-arm SQL internally.
 
@@ -151,7 +150,6 @@ class PostgresMemories(MemoriesExtension):
                 min_semantic=min_semantic,
                 min_keyword=min_keyword,
                 graph_seed_min_similarity=graph_seed_min_similarity,
-                candidate_ceiling=candidate_ceiling,
             )
 
             temporal_by_ft: dict[str, list] = {}
@@ -229,57 +227,56 @@ class PostgresMemories(MemoriesExtension):
         min_semantic: float | None = None,
         min_keyword: float | None = None,
         graph_seed_min_similarity: float | None = None,
-        candidate_ceiling: int | None = None,
     ) -> "dict[str, SemanticBm25Result]":
-        """The dense + keyword arms, as one UNION query with the ANN candidate list sized for it."""
+        """The dense + keyword arms, as one UNION query, with the ANN search widened to match."""
         # Imported here: retrieval imports this package, so a module-level import
         # would close the cycle.
         from ..._vector_index import ann_candidate_list_settings, configured_vector_extension
-        from ..search.retrieval import plan_semantic_fetch, retrieve_semantic_bm25_combined_sql
+        from ..db.postgresql import apply_session_settings
+        from ..search.retrieval import retrieve_semantic_bm25_combined_sql
 
-        extension = configured_vector_extension()
-        plan = plan_semantic_fetch(limit, candidate_ceiling=candidate_ceiling, vector_extension=extension)
-
-        async def _run() -> "dict[str, SemanticBm25Result]":
-            return await retrieve_semantic_bm25_combined_sql(
-                conn,
-                query_embedding,
-                query_text,
-                bank_id,
-                fact_types,
-                limit,
-                tags=tags,
-                tags_match=tags_match,
-                tag_groups=tag_groups,
-                created_after=created_after,
-                created_before=created_before,
-                min_semantic=min_semantic,
-                min_keyword=min_keyword,
-                graph_seed_min_similarity=graph_seed_min_similarity,
-                semantic_plan=plan,
-            )
-
-        # Size the backend's ANN candidate list to what this query's semantic arms ask
-        # for. Without this the arms run against the connection's init-time default
-        # (see memory_engine._init_connection), which bounds an HNSW scan below the
-        # LIMIT they issue — the budget would widen the SQL and change nothing.
+        # An ANN scan explores a bounded candidate list and returns what it found, so
+        # that list — not the SQL LIMIT — decides how many rows the arms can come back
+        # with. pgvector's is `hnsw.ef_search`, fixed at 200 for the connection's
+        # lifetime by the pool's init callback; asking for 300 rows against it silently
+        # yielded ~200 (hnswscan.c ends the scan when the list drains, iterative scan
+        # being off by default). The recall budget therefore moved the LIMIT and nothing
+        # else. Widen the list to cover this query's own request instead.
         #
-        # Transaction-scoped so it reverts at commit and does not follow the connection
-        # into the temporal arm, which shares it and needs a far smaller list. Only the
-        # PG path applies it: Oracle's dialect has no equivalent knob, and the settings
-        # dispatcher is empty for vector backends that expose none.
-        settings = (
-            ann_candidate_list_settings(extension, candidates=plan.fetch_limit)
-            if getattr(conn, "backend_type", "postgresql") == "postgresql"
-            else ()
-        )
-        if not settings:
-            return await _run()
+        # Session-scoped rather than SET LOCAL: this is a read path, and wrapping it in
+        # a transaction to scope the setting would give recall transaction semantics it
+        # never had. asyncpg resets the connection on release and the pool re-applies its
+        # init settings on acquire, so the value cannot outlive this checkout. It does
+        # carry into the temporal arm, which shares the connection — a wider search for
+        # its entry points too, at its cost.
+        #
+        # Skipped entirely when the connection's standing value already covers the
+        # request (small budgets), on Oracle, and on vector backends exposing no such
+        # knob — for those, `ann_candidate_list_settings` returns nothing.
+        if getattr(conn, "backend_type", "postgresql") == "postgresql":
+            from ...config import DEFAULT_SEMANTIC_ANN_OVERSEARCH_FACTOR, get_config
 
-        async with conn.transaction():
-            for guc, value in settings:
-                await conn.execute(f"SET LOCAL {guc} = {value}")
-            return await _run()
+            # getattr: a config predating the field (older embedded profile) still resolves.
+            factor = getattr(get_config(), "semantic_ann_oversearch_factor", DEFAULT_SEMANTIC_ANN_OVERSEARCH_FACTOR)
+            settings = ann_candidate_list_settings(configured_vector_extension(), candidates=int(limit * factor))
+            await apply_session_settings(conn, list(settings))
+
+        return await retrieve_semantic_bm25_combined_sql(
+            conn,
+            query_embedding,
+            query_text,
+            bank_id,
+            fact_types,
+            limit,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
+            created_after=created_after,
+            created_before=created_before,
+            min_semantic=min_semantic,
+            min_keyword=min_keyword,
+            graph_seed_min_similarity=graph_seed_min_similarity,
+        )
 
     async def temporal_search(
         self,

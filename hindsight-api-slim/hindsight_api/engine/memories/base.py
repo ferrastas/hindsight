@@ -740,7 +740,6 @@ class MemoriesExtension(Extension, ABC):
         min_semantic: float | None = None,
         min_keyword: float | None = None,
         enable_graph: bool = True,
-        candidate_ceiling: int | None = None,
     ) -> "dict[str, RecallArms]":
         """Run ALL retrieval arms for every fact_type — the whole recall interface, in one call.
 
@@ -758,10 +757,6 @@ class MemoriesExtension(Extension, ABC):
         ``conn`` is the store's connection handle for the call. Postgres treats it as the pool it
         acquires its own connections from and runs the graph arm on; a store that reaches its index
         another way (e.g. over the network) ignores it.
-
-        ``candidate_ceiling`` is the most candidates the caller will keep once the arms are fused
-        — the budget-resolved reranker cap. It is a hint, not a filter: a store may use it to avoid
-        retrieving rows that fusion would discard anyway. ``None`` means the store decides.
         """
 
     def graph_retriever(self) -> "GraphRetriever | None":

@@ -181,7 +181,6 @@ class InMemoryMemories(MemoriesExtension):
         min_semantic=None,
         min_keyword=None,
         enable_graph=True,
-        candidate_ceiling=None,
     ):
         # The one recall interface. This store owns its links (no separate graph arm), so it
         # answers dense/keyword from its own ``search`` and, when a window is given, temporal from

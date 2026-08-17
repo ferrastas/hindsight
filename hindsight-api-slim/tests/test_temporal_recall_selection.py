@@ -29,16 +29,9 @@ def _vec(*leading: float) -> str:
 
 
 class _FakeConn:
-    """A connection that can hold a transaction, which is all the stubbed arms need."""
+    """A connection that accepts the session settings the dense arms size for themselves."""
 
     backend_type = "postgresql"
-
-    def transaction(self):
-        @asynccontextmanager
-        async def _txn():
-            yield
-
-        return _txn()
 
     async def execute(self, sql, *params):
         return None
@@ -198,8 +191,8 @@ async def test_min_semantic_does_not_tighten_temporal_seed_threshold(monkeypatch
 
     @asynccontextmanager
     async def fake_acquire_with_retry(pool, *args, **kwargs):
-        # The dense arms scope their ANN candidate list with SET LOCAL, so the double has
-        # to be a connection that can hold a transaction, not a bare object.
+        # The dense arms widen the ANN candidate list on their connection, so the double
+        # has to accept a statement rather than be a bare object.
         yield _FakeConn()
 
     async def fake_semantic_bm25_combined_sql(*args, **kwargs):

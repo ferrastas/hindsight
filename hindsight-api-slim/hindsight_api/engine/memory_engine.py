@@ -5835,9 +5835,6 @@ class MemoryEngine(MemoryEngineInterface):
                         min_keyword=min_scores.keyword if min_scores else None,
                         enable_temporal_retrieval=enable_temporal_retrieval,
                         enable_graph_retrieval=enable_graph_retrieval,
-                        # Fusion truncates to this cap before scoring (Step 4), so retrieving
-                        # more dense candidates than it only pays to discard them.
-                        candidate_ceiling=reranker_max_candidates,
                     )
                     parallel_duration = time.time() - parallel_start
             finally:
