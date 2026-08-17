@@ -14,7 +14,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from ...config import DEFAULT_BM25_MAX_QUERY_TERMS, get_config
+from ..._vector_index import ann_candidate_list_max, configured_vector_extension
+from ...config import (
+    DEFAULT_BM25_MAX_QUERY_TERMS,
+    DEFAULT_RERANKER_MAX_CANDIDATES,
+    DEFAULT_SEMANTIC_OVERFETCH_FACTOR,
+    MIN_SEMANTIC_FETCH,
+    get_config,
+)
 from ..db.ops import UpdatedWindow
 from ..memory_engine import fq_table, get_current_schema
 from ..sql import create_sql_dialect
@@ -37,6 +44,66 @@ def tokenize_query(query_text: str) -> list[str]:
     Returns an empty list when the query contains no word characters.
     """
     return re.sub(r"[^\w\s]", " ", query_text.lower()).split()
+
+
+@dataclass(frozen=True)
+class SemanticFetchPlan:
+    """How wide one fact_type's semantic arm runs: what it asks the index for, what it keeps.
+
+    The two numbers are resolved together because they have to agree. ``fetch_limit`` is
+    the arm's SQL ``LIMIT`` *and*, on a backend with a per-query candidate-list knob, the
+    size that knob is set to for the same statement — an ANN scan cannot return more rows
+    than its candidate list holds, so a ``LIMIT`` above it is unreachable through the index.
+    """
+
+    keep_limit: int
+    """Rows the arm keeps after trimming — never more than the pipeline can consume."""
+
+    fetch_limit: int
+    """Rows the arm asks the index for, over-fetched to survive post-scan filtering."""
+
+
+def plan_semantic_fetch(
+    limit: int,
+    *,
+    candidate_ceiling: int | None = None,
+    vector_extension: str | None = None,
+) -> SemanticFetchPlan:
+    """Size the semantic arm for one recall, from the caller's budget.
+
+    Two things bound how wide the arm usefully runs:
+
+    - **What the pipeline consumes.** Fused candidates are truncated to the reranker's
+      budget (``reranker_max_candidates``, or the caller's budget-resolved override)
+      before scoring, so semantic rows beyond that are dropped by RRF rank no matter
+      what. ``candidate_ceiling`` carries that number; rows past it are never kept.
+    - **What the index can return.** On pgvector the candidate list caps a scan at
+      1000 rows (see :func:`ann_candidate_list_max`), so a larger ``LIMIT`` buys
+      nothing through the index and only widens a sequential-scan fallback.
+
+    Between the two sits ``semantic_overfetch_factor``: the arm asks for more rows than
+    it keeps, because ANN is approximate and because the similarity floor, tag and date
+    filters are applied *after* the index scan.
+    """
+    config = get_config()
+
+    # getattr fallbacks: a config predating these fields (older embedded profiles,
+    # test doubles) must still resolve a sane plan rather than raise.
+    if candidate_ceiling is None:
+        candidate_ceiling = getattr(config, "reranker_max_candidates", DEFAULT_RERANKER_MAX_CANDIDATES)
+    keep_limit = min(limit, candidate_ceiling) if candidate_ceiling and candidate_ceiling > 0 else limit
+
+    factor = getattr(config, "semantic_overfetch_factor", DEFAULT_SEMANTIC_OVERFETCH_FACTOR)
+    fetch_limit = max(int(keep_limit * factor), MIN_SEMANTIC_FETCH)
+
+    ceiling = ann_candidate_list_max(vector_extension or configured_vector_extension())
+    if ceiling is not None:
+        fetch_limit = min(fetch_limit, ceiling)
+
+    # The arm cannot keep rows the index was never asked for. This binds only when the
+    # backend ceiling cuts below the budget, and keeps the two numbers honest for the
+    # callers that log or trace them.
+    return SemanticFetchPlan(keep_limit=min(keep_limit, fetch_limit), fetch_limit=fetch_limit)
 
 
 @dataclass
@@ -134,6 +201,7 @@ async def retrieve_semantic_bm25_combined_sql(
     min_semantic: float | None = None,
     min_keyword: float | None = None,
     graph_seed_min_similarity: float | None = None,
+    semantic_plan: SemanticFetchPlan | None = None,
 ) -> dict[str, SemanticBm25Result]:
     """
     Combined semantic + BM25 retrieval for multiple fact types in a single query.
@@ -147,10 +215,13 @@ async def retrieve_semantic_bm25_combined_sql(
     idx_mu_emb_observation, idx_mu_emb_experience), created automatically by
     Alembic migration a3b4c5d6e7f8_add_partial_hnsw_indexes.py.
 
-    HNSW is approximate — semantic arms over-fetch by 5x (min 100) and trim to
-    limit in Python to compensate.  ef_search=200 is set globally on pool
-    connections at init time (see memory_engine.py) to improve recall on sparse
-    graphs.
+    ANN is approximate and its filters are applied after the index scan, so the
+    semantic arms over-fetch and trim in Python to compensate. How far is resolved by
+    :func:`plan_semantic_fetch` from the caller's budget — not a fixed multiple — so the
+    request stays inside both what the pipeline can consume and what the index can
+    return. The caller is responsible for sizing the backend's candidate list to
+    ``plan.fetch_limit`` for this statement (``PostgresMemories.search`` does), because
+    an ANN scan cannot return more rows than that list holds.
 
     fact_type values are inlined as literals (safe: they come from a controlled
     internal enum, never from user input).
@@ -164,6 +235,9 @@ async def retrieve_semantic_bm25_combined_sql(
         limit: Maximum results per method per fact type
         tags: Optional tags to filter by
         tags_match: Tag matching mode
+        semantic_plan: Pre-resolved semantic arm sizing. Pass the same plan the caller
+            sized the backend's candidate list with, so the SQL LIMIT and that list
+            agree. Defaults to planning from ``limit`` alone.
 
     Returns:
         Candidate groups for each fact type. ``graph_seeds`` is ``None`` when
@@ -180,8 +254,9 @@ async def retrieve_semantic_bm25_combined_sql(
     sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity
     bm25_min = min_keyword if min_keyword is not None else config.bm25_min_score
 
-    # Over-fetch for HNSW approximation; semantic results trimmed to limit in Python.
-    hnsw_fetch = max(limit * 5, 100)
+    # Over-fetch for ANN approximation; semantic results trimmed to plan.keep_limit below.
+    plan = semantic_plan if semantic_plan is not None else plan_semantic_fetch(limit)
+    hnsw_fetch = plan.fetch_limit
 
     cols = (
         "id, text, context, event_date, occurred_start, occurred_end, mentioned_at, "
@@ -371,7 +446,7 @@ async def retrieve_semantic_bm25_combined_sql(
         if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity
         else None
     )
-    semantic_candidate_limit = max(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)
+    semantic_candidate_limit = max(plan.keep_limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)
     semantic_candidates: dict[str, list[RetrievalResult]] = {ft: [] for ft in fact_types}
     for r in rows:
         row = dict(r)
@@ -386,7 +461,7 @@ async def retrieve_semantic_bm25_combined_sql(
             result_dict[ft].bm25.append(RetrievalResult.from_db_row(row))
 
     for ft, candidates in semantic_candidates.items():
-        result_dict[ft].semantic.extend(candidates[:limit])
+        result_dict[ft].semantic.extend(candidates[: plan.keep_limit])
         if graph_seed_threshold is not None:
             result_dict[ft].graph_seeds = [
                 candidate
@@ -804,6 +879,7 @@ async def retrieve_all_fact_types_parallel(
     min_keyword: float | None = None,
     enable_temporal_retrieval: bool = True,
     enable_graph_retrieval: bool = True,
+    candidate_ceiling: int | None = None,
 ) -> MultiFactTypeRetrievalResult:
     """
     Retrieve every recall arm for all fact types, through the memories store.
@@ -827,6 +903,10 @@ async def retrieve_all_fact_types_parallel(
             query analysis that feeds it (no constraint means nothing to filter on).
         enable_graph_retrieval: Run the entity/link graph arm. False skips those queries
             and returns no graph results.
+        candidate_ceiling: Most candidates the caller's pipeline will keep after fusion
+            (the budget-resolved reranker cap). Bounds how wide the semantic arm runs,
+            since rows past it are dropped by RRF rank anyway. None falls back to the
+            configured reranker cap.
 
     Returns:
         MultiFactTypeRetrievalResult with results organized by fact type
@@ -872,6 +952,7 @@ async def retrieve_all_fact_types_parallel(
         min_semantic=min_semantic,
         min_keyword=min_keyword,
         enable_graph=enable_graph_retrieval,
+        candidate_ceiling=candidate_ceiling,
     )
 
     results_by_fact_type: dict[str, ParallelRetrievalResult] = {}

@@ -53,7 +53,10 @@ _INDEX_TYPE_KEYWORDS = {
 # - pgvector exposes hnsw.ef_search. The 60 / 200 pair is unchanged from the
 #   pre-dispatcher code (internal benchmarks tuned around our embedding count
 #   and recall floor; see the link_utils / pool init call sites for the
-#   latency-vs-recall framing).
+#   latency-vs-recall framing). These are *starting* values for a connection —
+#   recall's semantic arms size the list to their own query on top of it, via
+#   ann_candidate_list_settings, because a fixed 200 bounds an HNSW scan below
+#   the LIMIT a larger recall budget issues.
 # - vchord exposes vchordrq.probes, but its shape must match the index's
 #   build.internal.lists hierarchy. VectorChord 1.1 added per-index fallback
 #   parameters for this reason: a session GUC overrides every vchordrq index,
@@ -68,6 +71,22 @@ _ANN_TUNING_LOW_LATENCY: dict[str, tuple[tuple[str, str], ...]] = {
 }
 _ANN_TUNING_HIGH_RECALL: dict[str, tuple[tuple[str, str], ...]] = {
     "pgvector": (("hnsw.ef_search", "200"),),
+}
+
+# Largest candidate list a backend accepts, per query. For pgvector this is a hard
+# GUC bound: `hnsw.ef_search` is declared with a valid range of 1..1000
+# (HNSW_MAX_EF_SEARCH), and SET rejects anything above it. It doubles as the ceiling
+# on how many rows one HNSW scan can return, because pgvector's candidate list *is*
+# the result set: the ground-layer search runs once with ef = hnsw.ef_search, and
+# when that list is drained the scan ends (hnswscan.c, iterative scan off — which is
+# the default and what Hindsight runs). So a `LIMIT` above this number is unreachable
+# through the index, and asking for one only costs a wider heap fetch when the
+# planner falls back to a sequential scan.
+#
+# Backends without a per-query candidate-list knob are absent: their scans are not
+# bounded this way, so the semantic arm's LIMIT stands on its own.
+_ANN_CANDIDATE_LIST: dict[str, tuple[str, int]] = {
+    "pgvector": ("hnsw.ef_search", 1000),
 }
 
 _EXTENSION_INSTALL_SQL = {
@@ -168,6 +187,37 @@ def ann_search_tuning_settings(ext: str, *, kind: str) -> tuple[tuple[str, str],
     else:
         raise ValueError(f"Unknown ANN tuning kind: {kind!r}")
     return table.get(_normalize_resolved(ext), ())
+
+
+def ann_candidate_list_max(ext: str) -> int | None:
+    """Return the largest per-query ANN candidate list this backend accepts.
+
+    ``None`` means the backend exposes no such bound, so nothing caps how many rows
+    a single index scan can return. Callers use this to clamp both the request they
+    make (:func:`ann_candidate_list_settings`) and the SQL ``LIMIT`` they pair it
+    with, so the two can never drift apart.
+    """
+    entry = _ANN_CANDIDATE_LIST.get(_normalize_resolved(ext))
+    return entry[1] if entry is not None else None
+
+
+def ann_candidate_list_settings(ext: str, *, candidates: int) -> tuple[tuple[str, str], ...]:
+    """Return (guc_name, value) pairs sizing the ANN candidate list for one query.
+
+    Unlike :func:`ann_search_tuning_settings`, which serves two fixed profiles at
+    connection init, this sizes the candidate list to what a specific query asks
+    for. The value is clamped to the backend's accepted range, so a caller may pass
+    the raw row count it wants without knowing the backend's bounds.
+
+    Returns an empty tuple for backends with no per-query knob, in which case the
+    caller should issue no SET at all. Wrap the pairs in ``SET LOCAL`` so the value
+    reverts at transaction end and does not leak to the connection's other queries.
+    """
+    entry = _ANN_CANDIDATE_LIST.get(_normalize_resolved(ext))
+    if entry is None:
+        return ()
+    guc, ceiling = entry
+    return ((guc, str(max(1, min(candidates, ceiling)))),)
 
 
 def uses_per_bank_vector_indexes(ext: str) -> bool:

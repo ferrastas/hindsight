@@ -21,6 +21,22 @@ from hindsight_api.engine.search import retrieval as retrieval_module
 _QUERY = "[0.1,0.2,0.3]"
 
 
+class FakeConn:
+    """A connection that can hold a transaction, which is all the stubbed arms need."""
+
+    backend_type = "postgresql"
+
+    def transaction(self):
+        @asynccontextmanager
+        async def _txn():
+            yield
+
+        return _txn()
+
+    async def execute(self, sql, *params):
+        return None
+
+
 @pytest.fixture
 def stub_retrieval(monkeypatch):
     """Stub the DB-backed arms and record which ones actually ran.
@@ -33,7 +49,9 @@ def stub_retrieval(monkeypatch):
 
     @asynccontextmanager
     async def fake_acquire_with_retry(pool, *args, **kwargs):
-        yield object()
+        # The dense arms scope their ANN candidate list with SET LOCAL, so the double has
+        # to be a connection that can hold a transaction, not a bare object.
+        yield FakeConn()
 
     async def fake_semantic_bm25_combined_sql(*args, **kwargs):
         return {"world": retrieval_module.SemanticBm25Result(semantic=[], bm25=[], graph_seeds=None)}

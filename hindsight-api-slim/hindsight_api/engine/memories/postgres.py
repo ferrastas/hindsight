@@ -101,6 +101,7 @@ class PostgresMemories(MemoriesExtension):
         min_semantic: float | None = None,
         min_keyword: float | None = None,
         enable_graph: bool = True,
+        candidate_ceiling: int | None = None,
     ) -> "dict[str, RecallArms]":
         """Run every recall arm for Postgres by orchestrating the split per-arm SQL internally.
 
@@ -150,6 +151,7 @@ class PostgresMemories(MemoriesExtension):
                 min_semantic=min_semantic,
                 min_keyword=min_keyword,
                 graph_seed_min_similarity=graph_seed_min_similarity,
+                candidate_ceiling=candidate_ceiling,
             )
 
             temporal_by_ft: dict[str, list] = {}
@@ -227,27 +229,57 @@ class PostgresMemories(MemoriesExtension):
         min_semantic: float | None = None,
         min_keyword: float | None = None,
         graph_seed_min_similarity: float | None = None,
+        candidate_ceiling: int | None = None,
     ) -> "dict[str, SemanticBm25Result]":
+        """The dense + keyword arms, as one UNION query with the ANN candidate list sized for it."""
         # Imported here: retrieval imports this package, so a module-level import
         # would close the cycle.
-        from ..search.retrieval import retrieve_semantic_bm25_combined_sql
+        from ..._vector_index import ann_candidate_list_settings, configured_vector_extension
+        from ..search.retrieval import plan_semantic_fetch, retrieve_semantic_bm25_combined_sql
 
-        return await retrieve_semantic_bm25_combined_sql(
-            conn,
-            query_embedding,
-            query_text,
-            bank_id,
-            fact_types,
-            limit,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
-            created_after=created_after,
-            created_before=created_before,
-            min_semantic=min_semantic,
-            min_keyword=min_keyword,
-            graph_seed_min_similarity=graph_seed_min_similarity,
+        extension = configured_vector_extension()
+        plan = plan_semantic_fetch(limit, candidate_ceiling=candidate_ceiling, vector_extension=extension)
+
+        async def _run() -> "dict[str, SemanticBm25Result]":
+            return await retrieve_semantic_bm25_combined_sql(
+                conn,
+                query_embedding,
+                query_text,
+                bank_id,
+                fact_types,
+                limit,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+                created_after=created_after,
+                created_before=created_before,
+                min_semantic=min_semantic,
+                min_keyword=min_keyword,
+                graph_seed_min_similarity=graph_seed_min_similarity,
+                semantic_plan=plan,
+            )
+
+        # Size the backend's ANN candidate list to what this query's semantic arms ask
+        # for. Without this the arms run against the connection's init-time default
+        # (see memory_engine._init_connection), which bounds an HNSW scan below the
+        # LIMIT they issue — the budget would widen the SQL and change nothing.
+        #
+        # Transaction-scoped so it reverts at commit and does not follow the connection
+        # into the temporal arm, which shares it and needs a far smaller list. Only the
+        # PG path applies it: Oracle's dialect has no equivalent knob, and the settings
+        # dispatcher is empty for vector backends that expose none.
+        settings = (
+            ann_candidate_list_settings(extension, candidates=plan.fetch_limit)
+            if getattr(conn, "backend_type", "postgresql") == "postgresql"
+            else ()
         )
+        if not settings:
+            return await _run()
+
+        async with conn.transaction():
+            for guc, value in settings:
+                await conn.execute(f"SET LOCAL {guc} = {value}")
+            return await _run()
 
     async def temporal_search(
         self,

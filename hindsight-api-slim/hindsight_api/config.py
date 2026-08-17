@@ -498,6 +498,7 @@ ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
 ENV_RERANKER_MAX_CANDIDATES_LOW = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_LOW"
 ENV_RERANKER_MAX_CANDIDATES_MID = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_MID"
 ENV_RERANKER_MAX_CANDIDATES_HIGH = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_HIGH"
+ENV_SEMANTIC_OVERFETCH_FACTOR = "HINDSIGHT_API_SEMANTIC_OVERFETCH_FACTOR"
 ENV_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY"
 ENV_GRAPH_SEED_MIN_SIMILARITY = "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY"
 ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"
@@ -1005,6 +1006,16 @@ DEFAULT_RERANKER_MAX_CANDIDATES = 300
 DEFAULT_RERANKER_MAX_CANDIDATES_LOW = 0
 DEFAULT_RERANKER_MAX_CANDIDATES_MID = 0
 DEFAULT_RERANKER_MAX_CANDIDATES_HIGH = 0
+# How far the semantic arm over-fetches past the rows it keeps, to compensate for
+# ANN approximation and for the filters (similarity floor, tags, date ranges) that
+# Postgres applies *after* the index scan. 2.0 leaves headroom for roughly half the
+# scanned rows to be filtered out. Raising it costs ANN work per query — on pgvector
+# the request also sizes hnsw.ef_search, whose accepted maximum (1000) caps the
+# useful range. 1.0 disables the over-fetch.
+DEFAULT_SEMANTIC_OVERFETCH_FACTOR = 2.0
+# Floor on the over-fetch, so a small budget still scans enough of the index to
+# survive post-scan filtering.
+MIN_SEMANTIC_FETCH = 100
 DEFAULT_SEMANTIC_MIN_SIMILARITY = 0.3
 DEFAULT_GRAPH_SEED_MIN_SIMILARITY = 0.3
 DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1
@@ -2353,6 +2364,7 @@ class HindsightConfig:
     reranker_max_candidates_low: int
     reranker_max_candidates_mid: int
     reranker_max_candidates_high: int
+    semantic_overfetch_factor: float
     semantic_min_similarity: float
     graph_seed_min_similarity: float
     temporal_semantic_min_similarity: float
@@ -2980,6 +2992,12 @@ class HindsightConfig:
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"Invalid {field_name}: {value}. Must be between 0.0 and 1.0")
 
+        if self.semantic_overfetch_factor < 1.0:
+            raise ValueError(
+                f"Invalid semantic_overfetch_factor: {self.semantic_overfetch_factor}. Must be >= 1.0 "
+                f"(1.0 fetches exactly the rows the arm keeps; below that it could not fill them)"
+            )
+
         if self.bm25_max_query_terms < 0:
             raise ValueError(f"Invalid bm25_max_query_terms: {self.bm25_max_query_terms}. Must be >= 0")
 
@@ -3480,6 +3498,9 @@ class HindsightConfig:
             ),
             reranker_max_candidates_high=int(
                 os.getenv(ENV_RERANKER_MAX_CANDIDATES_HIGH, str(DEFAULT_RERANKER_MAX_CANDIDATES_HIGH))
+            ),
+            semantic_overfetch_factor=float(
+                os.getenv(ENV_SEMANTIC_OVERFETCH_FACTOR, str(DEFAULT_SEMANTIC_OVERFETCH_FACTOR))
             ),
             semantic_min_similarity=float(os.getenv(ENV_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_SEMANTIC_MIN_SIMILARITY))),
             graph_seed_min_similarity=float(

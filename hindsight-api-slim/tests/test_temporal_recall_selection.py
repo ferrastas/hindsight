@@ -28,6 +28,22 @@ def _vec(*leading: float) -> str:
     return "[" + ",".join(str(v) for v in values) + "]"
 
 
+class _FakeConn:
+    """A connection that can hold a transaction, which is all the stubbed arms need."""
+
+    backend_type = "postgresql"
+
+    def transaction(self):
+        @asynccontextmanager
+        async def _txn():
+            yield
+
+        return _txn()
+
+    async def execute(self, sql, *params):
+        return None
+
+
 # Query vector + vectors at known cosine similarities to it.
 _QUERY = _vec(1.0)
 _SIM_100 = _vec(1.0)  # cosine 1.0
@@ -182,7 +198,9 @@ async def test_min_semantic_does_not_tighten_temporal_seed_threshold(monkeypatch
 
     @asynccontextmanager
     async def fake_acquire_with_retry(pool, *args, **kwargs):
-        yield object()
+        # The dense arms scope their ANN candidate list with SET LOCAL, so the double has
+        # to be a connection that can hold a transaction, not a bare object.
+        yield _FakeConn()
 
     async def fake_semantic_bm25_combined_sql(*args, **kwargs):
         return {"world": retrieval_module.SemanticBm25Result(semantic=[], bm25=[], graph_seeds=None)}
