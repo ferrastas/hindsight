@@ -4,12 +4,12 @@ An ANN scan explores a bounded candidate list and returns what it found, so that
 — not the SQL LIMIT — decides how many rows the arm can come back with. pgvector's is
 ``hnsw.ef_search``, pinned at 200 for the connection's lifetime by the pool's init
 callback, which silently capped every recall at ~200 dense candidates however large the
-budget. ``PostgresMemories.search`` now widens it to cover the rows the query asks for.
+budget. ``PostgresMemories.search`` now sizes it to the rows the query asks for.
 
 Covers:
 - :func:`ann_candidate_list_settings`: clamping, and staying silent when the
   connection's standing value already covers the request.
-- That ``search`` issues the widened value for a large budget, issues nothing for a
+- That ``search`` issues the wider value for a large budget, issues nothing for a
   small one, and does not open a transaction to do it.
 - That the semantic arms ask the index for exactly ``limit`` rows (no over-fetch).
 """
@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hindsight_api._vector_index import ann_candidate_list_max, ann_candidate_list_settings
+from hindsight_api._vector_index import ann_candidate_list_settings
 from hindsight_api.engine.memories.postgres import PostgresMemories
 from hindsight_api.engine.search import retrieval as retrieval_mod
 
@@ -50,14 +50,13 @@ def test_stays_silent_when_the_standing_value_already_covers_it():
 
 def test_request_is_clamped_to_the_backend_maximum():
     """pgvector declares hnsw.ef_search valid over 1..1000; SET rejects more."""
-    assert ann_candidate_list_max("pgvector") == 1000
+    assert ann_candidate_list_settings("pgvector", candidates=1000) == (("hnsw.ef_search", "1000"),)
     assert ann_candidate_list_settings("pgvector", candidates=99_999) == (("hnsw.ef_search", "1000"),)
 
 
 def test_backends_without_the_knob_get_no_setting():
     """vchord / diskann / scann expose no per-query candidate list."""
     for ext in ("vchord", "pgvectorscale", "pg_diskann", "scann"):
-        assert ann_candidate_list_max(ext) is None
         assert ann_candidate_list_settings(ext, candidates=5000) == ()
 
 
@@ -114,7 +113,6 @@ def search_path(monkeypatch):
     """Stub the query builder and config so only the sizing behaviour is under test."""
     dialect = FakeDialect()
     config = SimpleNamespace(
-        semantic_ann_oversearch_factor=2.0,
         # Read by the query builder when the arms are assembled.
         semantic_min_similarity=0.0,
         bm25_min_score=0.0,
@@ -143,15 +141,16 @@ async def _search(conn, limit: int, fact_types: list[str] | None = None):
 
 
 async def test_large_budget_widens_the_search(search_path):
+    """The list is sized to the rows asked for, which the standing 200 cannot cover."""
     conn = FakeConn()
     await _search(conn, BUDGET_MID)
 
-    assert conn.settings_applied() == [("hnsw.ef_search", "600")]
+    assert conn.settings_applied() == [("hnsw.ef_search", str(BUDGET_MID))]
     assert conn.transactions == 0
 
 
 async def test_small_budget_issues_no_setting(search_path):
-    """100 x 2.0 is the standing value, so there is nothing to widen."""
+    """The standing 200 already covers a budget of 100 — and is never narrowed to it."""
     conn = FakeConn()
     await _search(conn, BUDGET_LOW)
 
@@ -180,20 +179,3 @@ async def test_oracle_gets_no_pgvector_setting(search_path):
     await _search(conn, BUDGET_MID)
 
     assert conn.settings_applied() == []
-
-
-async def test_factor_of_one_searches_no_wider_than_asked(search_path, monkeypatch):
-    config = SimpleNamespace(
-        semantic_ann_oversearch_factor=1.0,
-        semantic_min_similarity=0.0,
-        bm25_min_score=0.0,
-        text_search_extension="native",
-        text_search_extension_native_language="english",
-    )
-    monkeypatch.setattr(retrieval_mod, "get_config", lambda: config)
-    monkeypatch.setattr("hindsight_api.config.get_config", lambda: config)
-
-    conn = FakeConn()
-    await _search(conn, BUDGET_MID)
-
-    assert conn.settings_applied() == [("hnsw.ef_search", "300")]

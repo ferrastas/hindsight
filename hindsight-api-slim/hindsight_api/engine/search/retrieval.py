@@ -362,11 +362,10 @@ async def retrieve_semantic_bm25_combined_sql(
         else:
             raise
 
-    # Group results. The semantic SQL deliberately over-fetches for HNSW recall;
-    # when that pool also covers the graph threshold, derive graph entry points
-    # from the same ordered rows instead of issuing one duplicate ANN query per
-    # fact type. Convert only the prefix either consumer can observe, not the
-    # entire HNSW over-fetch pool.
+    # Group results. The graph arm needs its own entry points, but when the dense
+    # rows already cover its threshold, derive them from the same ordered rows
+    # instead of issuing one duplicate ANN query per fact type. Convert only the
+    # prefix either consumer can observe, not every row returned.
     graph_seed_threshold = (
         graph_seed_min_similarity
         if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity

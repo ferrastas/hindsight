@@ -190,16 +190,6 @@ def ann_search_tuning_settings(ext: str, *, kind: str) -> tuple[tuple[str, str],
     return table.get(_normalize_resolved(ext), ())
 
 
-def ann_candidate_list_max(ext: str) -> int | None:
-    """Return the largest per-query ANN candidate list this backend accepts.
-
-    ``None`` means the backend exposes no such knob, so nothing bounds how many rows
-    a single index scan can return.
-    """
-    entry = _ANN_CANDIDATE_LIST.get(_normalize_resolved(ext))
-    return entry[1] if entry is not None else None
-
-
 def ann_candidate_list_settings(ext: str, *, candidates: int) -> tuple[tuple[str, str], ...]:
     """Return (guc_name, value) pairs widening the ANN candidate list for one query.
 

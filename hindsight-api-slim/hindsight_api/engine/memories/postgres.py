@@ -107,8 +107,8 @@ class PostgresMemories(MemoriesExtension):
         The per-arm split is Postgres's own business, kept off the interface: this reproduces the
         exact orchestration recall used before it was unified — one dense+BM25 UNION query and the
         temporal query share a single connection, then the graph retriever runs per fact_type on the
-        pool in parallel, seeded by the same dense over-fetch. Result is byte-identical to running
-        the arms separately; fusion/rerank still happen downstream.
+        pool in parallel, seeded by the same dense results. Result is byte-identical to running the
+        arms separately; fusion/rerank still happen downstream.
         """
         import asyncio
 
@@ -172,7 +172,7 @@ class PostgresMemories(MemoriesExtension):
                 )
 
         # Graph per fact_type in parallel, on the pool, after the dense connection is released —
-        # seeded by the dense over-fetch (preselected_semantic_seeds), matching the prior path.
+        # seeded by the dense results (preselected_semantic_seeds), matching the prior path.
         graph_by_ft: dict[str, list] = {ft: [] for ft in fact_types}
         if enable_graph:
             assert retriever is not None  # only resolved when the arm is on
@@ -241,7 +241,14 @@ class PostgresMemories(MemoriesExtension):
         # lifetime by the pool's init callback; asking for 300 rows against it silently
         # yielded ~200 (hnswscan.c ends the scan when the list drains, iterative scan
         # being off by default). The recall budget therefore moved the LIMIT and nothing
-        # else. Widen the list to cover this query's own request instead.
+        # else. Ask for a list at least as wide as the rows the query wants.
+        #
+        # Exactly `limit`, with no headroom multiplier: the similarity floor, tags and
+        # date ranges are applied after the scan, so a filtered query can still come back
+        # with fewer rows than it asked for. Widening the list is not the fix for that —
+        # `hnsw.iterative_scan` (pgvector 0.8+) is, by resuming the scan until the LIMIT
+        # is met. A multiplier here would only buy partial cover for filtered queries
+        # while making every unfiltered one do more work.
         #
         # Session-scoped rather than SET LOCAL: this is a read path, and wrapping it in
         # a transaction to scope the setting would give recall transaction semantics it
@@ -253,12 +260,8 @@ class PostgresMemories(MemoriesExtension):
         # Skipped entirely when the connection's standing value already covers the
         # request (small budgets), on Oracle, and on vector backends exposing no such
         # knob — for those, `ann_candidate_list_settings` returns nothing.
-        if getattr(conn, "backend_type", "postgresql") == "postgresql":
-            from ...config import DEFAULT_SEMANTIC_ANN_OVERSEARCH_FACTOR, get_config
-
-            # getattr: a config predating the field (older embedded profile) still resolves.
-            factor = getattr(get_config(), "semantic_ann_oversearch_factor", DEFAULT_SEMANTIC_ANN_OVERSEARCH_FACTOR)
-            settings = ann_candidate_list_settings(configured_vector_extension(), candidates=int(limit * factor))
+        if conn.backend_type == "postgresql":
+            settings = ann_candidate_list_settings(configured_vector_extension(), candidates=limit)
             await apply_session_settings(conn, list(settings))
 
         return await retrieve_semantic_bm25_combined_sql(

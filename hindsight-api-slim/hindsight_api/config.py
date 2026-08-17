@@ -498,7 +498,6 @@ ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
 ENV_RERANKER_MAX_CANDIDATES_LOW = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_LOW"
 ENV_RERANKER_MAX_CANDIDATES_MID = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_MID"
 ENV_RERANKER_MAX_CANDIDATES_HIGH = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_HIGH"
-ENV_SEMANTIC_ANN_OVERSEARCH_FACTOR = "HINDSIGHT_API_SEMANTIC_ANN_OVERSEARCH_FACTOR"
 ENV_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY"
 ENV_GRAPH_SEED_MIN_SIMILARITY = "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY"
 ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"
@@ -1006,14 +1005,6 @@ DEFAULT_RERANKER_MAX_CANDIDATES = 300
 DEFAULT_RERANKER_MAX_CANDIDATES_LOW = 0
 DEFAULT_RERANKER_MAX_CANDIDATES_MID = 0
 DEFAULT_RERANKER_MAX_CANDIDATES_HIGH = 0
-# How much wider the semantic arm searches the vector index than the number of rows
-# it asks for. The ANN candidate list bounds both the quality of the ranking and how
-# many rows the scan can return at all, and the filters that thin the result
-# (similarity floor, tags, date ranges) are applied *after* the scan — so a query
-# wanting N rows must explore more than N candidates. 2.0 leaves headroom for roughly
-# half of them to be filtered out. Raising it costs ANN work per query and is bounded
-# by the backend's own maximum (pgvector: 1000). 1.0 searches no wider than asked.
-DEFAULT_SEMANTIC_ANN_OVERSEARCH_FACTOR = 2.0
 DEFAULT_SEMANTIC_MIN_SIMILARITY = 0.3
 DEFAULT_GRAPH_SEED_MIN_SIMILARITY = 0.3
 DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1
@@ -2362,7 +2353,6 @@ class HindsightConfig:
     reranker_max_candidates_low: int
     reranker_max_candidates_mid: int
     reranker_max_candidates_high: int
-    semantic_ann_oversearch_factor: float
     semantic_min_similarity: float
     graph_seed_min_similarity: float
     temporal_semantic_min_similarity: float
@@ -2990,12 +2980,6 @@ class HindsightConfig:
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"Invalid {field_name}: {value}. Must be between 0.0 and 1.0")
 
-        if self.semantic_ann_oversearch_factor < 1.0:
-            raise ValueError(
-                f"Invalid semantic_ann_oversearch_factor: {self.semantic_ann_oversearch_factor}. Must be >= 1.0 "
-                f"(1.0 searches exactly as wide as the rows requested; below that the arm could not fill them)"
-            )
-
         if self.bm25_max_query_terms < 0:
             raise ValueError(f"Invalid bm25_max_query_terms: {self.bm25_max_query_terms}. Must be >= 0")
 
@@ -3496,9 +3480,6 @@ class HindsightConfig:
             ),
             reranker_max_candidates_high=int(
                 os.getenv(ENV_RERANKER_MAX_CANDIDATES_HIGH, str(DEFAULT_RERANKER_MAX_CANDIDATES_HIGH))
-            ),
-            semantic_ann_oversearch_factor=float(
-                os.getenv(ENV_SEMANTIC_ANN_OVERSEARCH_FACTOR, str(DEFAULT_SEMANTIC_ANN_OVERSEARCH_FACTOR))
             ),
             semantic_min_similarity=float(os.getenv(ENV_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_SEMANTIC_MIN_SIMILARITY))),
             graph_seed_min_similarity=float(
